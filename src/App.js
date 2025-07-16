@@ -8,26 +8,51 @@ import Confetti from 'react-confetti';
 import config from './config';
 import './App.css';
 
+// Viewport height calculation
+const setViewportHeight = () => {
+  const vh = window.innerHeight * 0.01;
+  document.documentElement.style.setProperty('--vh', `${vh}px`);
+};
+
+// Home Component
 function Home() {
   const [name, setName] = useState('');
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
   const navigate = useNavigate();
+
+  useEffect(() => {
+    setViewportHeight();
+    window.addEventListener('resize', setViewportHeight);
+    return () => window.removeEventListener('resize', setViewportHeight);
+  }, []);
 
   const handleCreateRoom = async (e) => {
     e.preventDefault();
-    if (!name) return;
+    if (!name.trim()) {
+      setError('Lütfen isminizi girin');
+      return;
+    }
+    setError('');
     setLoading(true);
+
     try {
       const res = await fetch(`${config.apiUrl}/api/rooms`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ownerName: name })
+        body: JSON.stringify({ ownerName: name.trim() })
       });
+      
+      if (!res.ok) {
+        throw new Error('Oda oluşturulurken bir hata oluştu');
+      }
+      
       const data = await res.json();
-      setLoading(false);
-      navigate(`/rulet/${data.roomId}`, { state: { name } });
+      navigate(`/rulet/${data.roomId}`, { state: { name: name.trim() } });
     } catch (error) {
       console.error('Error creating room:', error);
+      setError('Oda oluşturulurken bir hata oluştu. Lütfen tekrar deneyin.');
+    } finally {
       setLoading(false);
     }
   };
@@ -38,7 +63,7 @@ function Home() {
         <GiCoffeeCup className="coffee-icon" size={50} />
         <h1 className="title">Kahve Ruleti</h1>
         <p className="subtitle">Kim kahve yapacak? Hadi öğrenelim!</p>
-        <form onSubmit={handleCreateRoom}>
+        <form onSubmit={handleCreateRoom} className="join-form">
           <div className="input-group">
             <input
               type="text"
@@ -46,9 +71,12 @@ function Home() {
               value={name}
               onChange={e => setName(e.target.value)}
               required
+              autoComplete="name"
+              maxLength={30}
             />
           </div>
-          <button type="submit" disabled={loading}>
+          {error && <div className="error-message">{error}</div>}
+          <button type="submit" disabled={loading || !name.trim()}>
             {loading ? 'Oluşturuluyor...' : 'Kahve Ruleti Başlat'} <FaCoffee style={{ marginLeft: '8px' }} />
           </button>
         </form>
@@ -57,83 +85,142 @@ function Home() {
   );
 }
 
+// JoinRoom Component
 function JoinRoom() {
-  const { roomId } = useParams();
-  const location = useLocation();
-  const [name, setName] = useState(location.state?.name || '');
-  const [joined, setJoined] = useState(!!location.state?.name);
-  const [participants, setParticipants] = useState([]);
-  const [roomOwner, setRoomOwner] = useState('');
-  const [error, setError] = useState('');
-  const navigate = useNavigate();
-  const socketRef = useRef(null);
-  const [winner, setWinner] = useState(null);
-  const [copied, setCopied] = useState(false);
-  const [expired, setExpired] = useState(false);
-  const [rouletteError, setRouletteError] = useState('');
-  const [joinError, setJoinError] = useState('');
-  const [inputName, setInputName] = useState('');
-  const [mustSpin, setMustSpin] = useState(false);
-  const [prizeNumber, setPrizeNumber] = useState(0);
-  const [isSpinning, setIsSpinning] = useState(false);
-  const [showConfetti, setShowConfetti] = useState(false);
-  const [windowSize, setWindowSize] = useState({
-    width: window.innerWidth,
-    height: window.innerHeight,
+  // State Management
+  const [roomState, setRoomState] = useState({
+    name: '',
+    joined: false,
+    participants: [],
+    roomOwner: '',
+    error: '',
+    expired: false,
+    rouletteError: '',
+    joinError: '',
+    inputName: '',
+    winner: null,
+    displayedWinner: null,
+    copied: false,
+    newParticipant: null
   });
 
+  const [rouletteState, setRouletteState] = useState({
+    mustSpin: false,
+    prizeNumber: 0,
+    isSpinning: false,
+    showConfetti: false
+  });
+
+  const [windowSize, setWindowSize] = useState({
+    width: window.innerWidth,
+    height: window.innerHeight
+  });
+
+  // Hooks
+  const { roomId } = useParams();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const socketRef = useRef(null);
+  const winnerRef = useRef(null);
+
+  // Effects
   useEffect(() => {
-    if (location.state?.name && !joined) {
-      setName(location.state.name);
-      setJoined(true);
-    }
-  }, [location.state, joined]);
+    setViewportHeight();
+    window.addEventListener('resize', setViewportHeight);
+    return () => window.removeEventListener('resize', setViewportHeight);
+  }, []);
 
   useEffect(() => {
-    fetch(`${config.apiUrl}/api/rooms/${roomId}`)
-      .then(res => res.json())
-      .then(data => {
-        if (data.error) setError(data.error);
-        else {
-          setRoomOwner(data.owner);
-          setParticipants(data.participants);
+    if (location.state?.name && !roomState.joined) {
+      setRoomState(prev => ({
+        ...prev,
+        name: location.state.name,
+        joined: true
+      }));
+    }
+  }, [location.state, roomState.joined]);
+
+  useEffect(() => {
+    const fetchRoomData = async () => {
+      try {
+        const res = await fetch(`${config.apiUrl}/api/rooms/${roomId}`);
+        const data = await res.json();
+        
+        if (data.error) {
+          setRoomState(prev => ({ ...prev, error: data.error }));
+        } else {
+          setRoomState(prev => ({
+            ...prev,
+            roomOwner: data.owner,
+            participants: data.participants
+          }));
         }
-      })
-      .catch(error => {
+      } catch (error) {
         console.error('Error fetching room:', error);
-        setError('Oda bulunamadı veya bir hata oluştu.');
-      });
+        setRoomState(prev => ({
+          ...prev,
+          error: 'Oda bulunamadı veya bir hata oluştu.'
+        }));
+      }
+    };
+
+    fetchRoomData();
   }, [roomId]);
 
   useEffect(() => {
-    if (!joined || !name) return;
-    socketRef.current = io(config.socketUrl);
-    socketRef.current.emit('join_room', { roomId, name });
-    socketRef.current.on('participants_update', (list) => {
-      setParticipants(list);
+    if (!roomState.joined || !roomState.name) return;
+
+    socketRef.current = io(config.socketUrl, {
+      query: { name: roomState.name }
     });
-    socketRef.current.on('joined', () => {
-      setJoined(true);
-    });
-    socketRef.current.on('join_error', (data) => {
-      setJoinError(data.message);
-    });
-    socketRef.current.on('roulette_result', (winner) => {
-      setWinner(winner);
-    });
-    socketRef.current.on('room_expired', (data) => {
-      setExpired(true);
-    });
-    return () => {
-      socketRef.current && socketRef.current.disconnect();
+
+    socketRef.current.emit('join_room', { roomId, name: roomState.name });
+    
+    const handleParticipantsUpdate = (list) => {
+      const newParticipantName = list.length > roomState.participants.length ? 
+        list[list.length - 1].name : null;
+      
+      if (newParticipantName && newParticipantName !== roomState.name) {
+        setRoomState(prev => ({ ...prev, newParticipant: newParticipantName }));
+        setTimeout(() => setRoomState(prev => ({ ...prev, newParticipant: null })), 10000);
+      }
+      
+      setRoomState(prev => ({ ...prev, participants: list }));
     };
-  }, [joined, roomId, name]);
+
+    const handleRouletteResult = (winner) => {
+      setRoomState(prev => ({ ...prev, winner }));
+    };
+
+    socketRef.current.on('participants_update', handleParticipantsUpdate);
+    socketRef.current.on('joined', () => setRoomState(prev => ({ ...prev, joined: true })));
+    socketRef.current.on('join_error', (data) => setRoomState(prev => ({ ...prev, joinError: data.message })));
+    socketRef.current.on('roulette_result', handleRouletteResult);
+    socketRef.current.on('room_expired', () => setRoomState(prev => ({ ...prev, expired: true })));
+
+    return () => {
+      socketRef.current?.disconnect();
+    };
+  }, [roomState.joined, roomId, roomState.name, roomState.participants.length]);
+
+  useEffect(() => {
+    if (roomState.winner) {
+      const winnerIndex = roomState.participants.findIndex(p => p.name === roomState.winner.name);
+      if (winnerIndex !== -1) {
+        setRouletteState(prev => ({
+          ...prev,
+          prizeNumber: winnerIndex,
+          mustSpin: true
+        }));
+      }
+    }
+  }, [roomState.winner, roomState.participants]);
 
   useEffect(() => {
     const handleResize = () => {
       setWindowSize({
         width: window.innerWidth,
-        height: window.innerHeight,
+        height: window.innerHeight
       });
     };
 
@@ -141,71 +228,78 @@ function JoinRoom() {
     return () => window.removeEventListener('resize', handleResize);
   }, []);
 
-  useEffect(() => {
-    if (winner) {
-      const winnerIndex = participants.findIndex(p => p.name === winner.name);
-      if (winnerIndex !== -1) {
-        setPrizeNumber(winnerIndex);
-        setMustSpin(true);
-      }
-    }
-  }, [winner, participants]);
-
+  // Handlers
   const handleJoin = (e) => {
     e.preventDefault();
-    if (!inputName) return;
-    setName(inputName);
-    setJoined(true);
+    if (!roomState.inputName.trim()) {
+      setRoomState(prev => ({ ...prev, joinError: 'Lütfen isminizi girin' }));
+      return;
+    }
+    setRoomState(prev => ({
+      ...prev,
+      joinError: '',
+      name: roomState.inputName,
+      joined: true
+    }));
   };
 
-  const inviteLink = `${window.location.origin}/rulet/${roomId}`;
   const handleCopy = () => {
+    const inviteLink = `${window.location.origin}/rulet/${roomId}`;
     navigator.clipboard.writeText(inviteLink);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
+    setRoomState(prev => ({ ...prev, copied: true }));
+    setTimeout(() => setRoomState(prev => ({ ...prev, copied: false })), 1500);
   };
 
   const handleStartRoulette = () => {
-    if (participants.length < 2) {
-      setRouletteError('Rulet başlatmak için en az iki katılımcı olmalı.');
-      setTimeout(() => setRouletteError(''), 2500);
+    if (roomState.participants.length < 2) {
+      setRoomState(prev => ({
+        ...prev,
+        rouletteError: 'Rulet başlatmak için en az iki katılımcı olmalı.'
+      }));
+      setTimeout(() => setRoomState(prev => ({ ...prev, rouletteError: '' })), 2500);
       return;
     }
-    setIsSpinning(true);
-    if (socketRef.current) {
-      socketRef.current.emit('start_roulette', { roomId });
-    }
+    setRoomState(prev => ({ ...prev, displayedWinner: null }));
+    setRouletteState(prev => ({ ...prev, isSpinning: true }));
+    socketRef.current?.emit('start_roulette', { roomId });
   };
 
-  const data = participants.map(p => ({
+  // Render Helpers
+  const renderError = () => (
+    <div className="App">
+      <div className="container">
+        <div className="error-message">{roomState.error}</div>
+        <button onClick={() => navigate('/')}><FaHome /> Ana Sayfa</button>
+      </div>
+    </div>
+  );
+
+  const renderExpired = () => (
+    <div className="App">
+      <div className="container">
+        <div className="error-message">
+          Davet linkinin süresi doldu. Rulet başlatıldıktan sonra yeni katılımcı eklenemez.
+        </div>
+        <button onClick={() => navigate('/')}><FaHome /> Ana Sayfa</button>
+      </div>
+    </div>
+  );
+
+  if (roomState.error) return renderError();
+  if (roomState.expired) return renderExpired();
+
+  const wheelData = roomState.participants.map(p => ({
     option: p.name,
     style: { backgroundColor: '#6F4E37', textColor: '#F5E6D3' }
   }));
 
   const wheelColors = ['#2C1810', '#6F4E37', '#D4A574', '#8B4513'];
-
-  if (error) return (
-    <div className="App">
-      <div className="container">
-        <div className="error-message">{error}</div>
-        <button onClick={() => navigate('/')}><FaHome /> Ana Sayfa</button>
-      </div>
-    </div>
-  );
-
-  if (expired) return (
-    <div className="App">
-      <div className="container">
-        <div className="error-message">Davet linkinin süresi doldu. Rulet başlatıldıktan sonra yeni katılımcı eklenemez.</div>
-        <button onClick={() => navigate('/')}><FaHome /> Ana Sayfa</button>
-      </div>
-    </div>
-  );
+  const inviteLink = `${window.location.origin}/rulet/${roomId}`;
 
   return (
     <div className="App">
       <div className="container">
-        {showConfetti && (
+        {rouletteState.showConfetti && (
           <Confetti
             width={windowSize.width}
             height={windowSize.height}
@@ -214,114 +308,137 @@ function JoinRoom() {
             colors={['#D4A574', '#6F4E37', '#2C1810', '#F5E6D3', '#FFFDD0']}
           />
         )}
-        <GiCoffeeBeans className="coffee-icon" size={40} />
-        <h1 className="title">Kahve Ruleti Odası</h1>
         
-        <div className="invite-link">
-          <input value={inviteLink} readOnly />
-          <button onClick={handleCopy}>
-            {copied ? 'Kopyalandı!' : 'Kopyala'} <FaCopy />
-          </button>
-          <p className="subtitle">Bu linki arkadaşlarınla paylaş!</p>
-        </div>
+        <h1 className="title">Kahve Ruleti</h1>
 
-        <p className="subtitle"><b>{roomOwner}</b> sizi Kahve Ruleti'ne davet etti!</p>
+        {roomState.newParticipant && (
+          <div className="notification">
+            <GiCoffeeCup className="notification-icon" />
+            <p>{roomState.newParticipant} kahve ruletine katıldı!</p>
+          </div>
+        )}
 
-        {!joined ? (
-          <form onSubmit={handleJoin}>
+        {!roomState.joined ? (
+          <form onSubmit={handleJoin} className="join-form">
             <div className="input-group">
               <input
                 type="text"
                 placeholder="İsminiz"
-                value={inputName}
-                onChange={e => setInputName(e.target.value)}
+                value={roomState.inputName}
+                onChange={e => setRoomState(prev => ({ ...prev, inputName: e.target.value }))}
                 required
+                autoComplete="name"
+                maxLength={30}
               />
             </div>
-            <button type="submit">Katıl <FaCoffee /></button>
-            {joinError && (
-              <div className="error-message">{joinError}</div>
+            {roomState.joinError && (
+              <div className="error-message">{roomState.joinError}</div>
             )}
+            <button type="submit" disabled={!roomState.inputName.trim()}>
+              Katıl <FaCoffee />
+            </button>
           </form>
         ) : (
-          <div>
-            <div className="participants-list">
-              <h3>Katılımcılar:</h3>
-              {participants.map((p, i) => (
-                <div key={i} className={`participant-card ${winner && winner.name === p.name ? 'winner' : ''}`}>
-                  <span>{p.name}</span>
-                  {winner && winner.name === p.name && <FaCoffee />}
-                </div>
-              ))}
+          <div className="roulette-wrapper">
+            <div className="roulette-container">
+              {roomState.participants.length > 0 && (
+                <Wheel
+                  mustStartSpinning={rouletteState.mustSpin}
+                  prizeNumber={rouletteState.prizeNumber}
+                  data={wheelData}
+                  backgroundColors={wheelColors}
+                  textColors={['#F5E6D3']}
+                  fontSize={16}
+                  outerBorderColor="#2C1810"
+                  outerBorderWidth={3}
+                  innerRadius={20}
+                  innerBorderColor="#D4A574"
+                  innerBorderWidth={2}
+                  radiusLineColor="#F5E6D3"
+                  radiusLineWidth={1}
+                  perpendicularText={true}
+                  spinDuration={0.4}
+                  startingOptionIndex={rouletteState.prizeNumber}
+                  rotationOffset={-2}
+                  disableInitialAnimation={true}
+                  dimensions={windowSize.width <= 768 ? 200 : 300}
+                  pointerProps={{
+                    src: "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZD0iTTEyIDJMNCAyMGwyMC0xMC0xMC0yeiIgZmlsbD0iI0Q0QTU3NCIvPjwvc3ZnPg==",
+                    style: { width: '30px', top: '-15px' }
+                  }}
+                  onStopSpinning={() => {
+                    setRouletteState(prev => ({ ...prev, mustSpin: false, isSpinning: false }));
+                    setTimeout(() => {
+                      setRoomState(prev => ({ ...prev, displayedWinner: prev.winner }));
+                      setRouletteState(prev => ({ ...prev, showConfetti: true }));
+                      setTimeout(() => setRouletteState(prev => ({ ...prev, showConfetti: false })), 5000);
+                    }, 500);
+                  }}
+                />
+              )}
             </div>
 
-            {participants.length >= 2 && (
-              <div className="roulette-container">
-                {participants.length > 0 && (
-                  <>
-                    <Wheel
-                      mustStartSpinning={mustSpin}
-                      prizeNumber={prizeNumber}
-                      data={data}
-                      backgroundColors={wheelColors}
-                      textColors={['#F5E6D3']}
-                      fontSize={16}
-                      outerBorderColor="#2C1810"
-                      outerBorderWidth={3}
-                      innerRadius={20}
-                      innerBorderColor="#D4A574"
-                      innerBorderWidth={2}
-                      radiusLineColor="#F5E6D3"
-                      radiusLineWidth={1}
-                      perpendicularText={true}
-                      onStopSpinning={() => {
-                        setMustSpin(false);
-                        setIsSpinning(false);
-                        setShowConfetti(true);
-                        setTimeout(() => setShowConfetti(false), 5000);
-                      }}
-                    />
-                    <div className="roulette-overlay">
-                      <FaCoffee className={isSpinning ? 'spinning' : ''} />
-                    </div>
-                  </>
-                )}
-              </div>
-            )}
-
-            {winner && !isSpinning && (
-              <div className="winner-announcement">
-                <h3><FaCoffee /> Sonuç <FaCoffee /></h3>
+            {roomState.displayedWinner && !rouletteState.isSpinning && (
+              <div className="winner-announcement" ref={winnerRef}>
                 <p className="winner-text">
-                  {winner.name} kahveyi yapmak için seçildi! ☕
+                  {roomState.displayedWinner.name} kahveyi yapacak! ☕
                 </p>
               </div>
             )}
 
-            {name === roomOwner && !winner && (
-              <button 
-                className="start-roulette-button" 
+            {roomState.name === roomState.roomOwner && !rouletteState.isSpinning && (
+              <button
+                className="start-roulette-button"
                 onClick={handleStartRoulette}
-                disabled={isSpinning || participants.length < 2}
+                disabled={rouletteState.isSpinning || roomState.participants.length < 2}
               >
-                {isSpinning ? 'Çekiliş yapılıyor...' : 'Kahve Ruletini Başlat'} <FaCoffee />
+                {rouletteState.isSpinning ? (
+                  <>
+                    <GiCoffeeBeans className="spinning" />
+                    Çevriliyor...
+                  </>
+                ) : (
+                  <>
+                    <GiCoffeeBeans />
+                    Ruleti Başlat
+                  </>
+                )}
               </button>
             )}
 
-            {rouletteError && (
-              <div className="error-message">{rouletteError}</div>
+            {roomState.rouletteError && (
+              <div className="error-message">{roomState.rouletteError}</div>
             )}
 
-            <button onClick={() => navigate('/')} style={{ marginTop: '1rem' }}>
-              <FaHome /> Ana Sayfa
-            </button>
+            {!roomState.displayedWinner && !rouletteState.isSpinning && (
+              <p className="waiting-text">
+                {roomState.name === roomState.roomOwner
+                  ? 'Katılımcıları bekliyorsunuz...'
+                  : 'Oda sahibinin ruleti başlatması bekleniyor...'}
+              </p>
+            )}
           </div>
         )}
+
+        <div className="bottom-controls">
+          <div className="invite-link">
+            <input
+              type="text"
+              value={inviteLink}
+              readOnly
+              onClick={e => e.target.select()}
+            />
+            <button onClick={handleCopy}>
+              {roomState.copied ? 'Kopyalandı!' : 'Davet Linki Kopyala'} <FaCopy />
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   );
 }
 
+// App Component
 function App() {
   return (
     <Router>
