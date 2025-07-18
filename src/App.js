@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { BrowserRouter as Router, Routes, Route, useParams, useNavigate, useLocation } from 'react-router-dom';
 import { io } from 'socket.io-client';
-import { FaCoffee, FaCopy, FaHome } from 'react-icons/fa';
+import { FaCoffee, FaCopy, FaHome, FaShare } from 'react-icons/fa';
 import { GiCoffeeBeans, GiCoffeeCup } from 'react-icons/gi';
 import { Wheel } from 'react-custom-roulette';
 import Confetti from 'react-confetti';
@@ -12,6 +12,17 @@ import './App.css';
 const setViewportHeight = () => {
   const vh = window.innerHeight * 0.01;
   document.documentElement.style.setProperty('--vh', `${vh}px`);
+};
+
+// Helper function to generate and store user ID
+const getUserId = (roomId, name) => {
+  const key = `user_${roomId}_${name}`;
+  let userId = localStorage.getItem(key);
+  if (!userId) {
+    userId = `user_${Math.random().toString(36).substr(2, 9)}`;
+    localStorage.setItem(key, userId);
+  }
+  return userId;
 };
 
 // Home Component
@@ -43,12 +54,26 @@ function Home() {
         body: JSON.stringify({ ownerName: name.trim() })
       });
       
+      const data = await res.json();
+      
       if (!res.ok) {
-        throw new Error('Oda oluşturulurken bir hata oluştu');
+        if (data.error === 'NAME_TAKEN') {
+          setError('Bu isim başka bir oda sahibi tarafından kullanılıyor. Lütfen başka bir isim deneyin.');
+        } else {
+          setError('Oda oluşturulurken bir hata oluştu. Lütfen tekrar deneyin.');
+        }
+        return;
       }
       
-      const data = await res.json();
-      navigate(`/rulet/${data.roomId}`, { state: { name: name.trim() } });
+      // Store room owner access token in localStorage
+      localStorage.setItem(`room_owner_${data.roomId}`, data.ownerToken);
+      navigate(`/rulet/${data.roomId}`, { 
+        state: { 
+          name: name.trim(), 
+          isOwner: true,
+          ownerToken: data.ownerToken 
+        } 
+      });
     } catch (error) {
       console.error('Error creating room:', error);
       setError('Oda oluşturulurken bir hata oluştu. Lütfen tekrar deneyin.');
@@ -101,8 +126,13 @@ function JoinRoom() {
     winner: null,
     displayedWinner: null,
     copied: false,
-    newParticipant: null
+    newParticipant: null,
+    userId: null
   });
+
+  // Bildirim için ayrı bir state ve ref
+  const [notification, setNotification] = useState(null);
+  const notificationTimer = useRef(null);
 
   const [rouletteState, setRouletteState] = useState({
     mustSpin: false,
@@ -132,13 +162,27 @@ function JoinRoom() {
 
   useEffect(() => {
     if (location.state?.name && !roomState.joined) {
+      const isOwner = location.state.isOwner;
+      const ownerToken = localStorage.getItem(`room_owner_${roomId}`);
+      const userId = getUserId(roomId, location.state.name);
+      
+      if (isOwner && !ownerToken) {
+        setRoomState(prev => ({
+          ...prev,
+          error: 'Bu odaya erişim yetkiniz yok. Oda sahibi yalnızca ilk girişte erişebilir.'
+        }));
+        return;
+      }
+      
       setRoomState(prev => ({
         ...prev,
         name: location.state.name,
-        joined: true
+        joined: true,
+        isOwner: isOwner,
+        userId: userId
       }));
     }
-  }, [location.state, roomState.joined]);
+  }, [location.state, roomState.joined, roomId]);
 
   useEffect(() => {
     const fetchRoomData = async () => {
@@ -171,37 +215,157 @@ function JoinRoom() {
     if (!roomState.joined || !roomState.name) return;
 
     socketRef.current = io(config.socketUrl, {
-      query: { name: roomState.name }
+      query: { 
+        name: roomState.name,
+        isOwner: location.state?.isOwner || false,
+        ownerToken: localStorage.getItem(`room_owner_${roomId}`),
+        userId: roomState.userId
+      },
+      reconnection: true,
+      reconnectionAttempts: 5,
+      reconnectionDelay: 1000
     });
 
-    socketRef.current.emit('join_room', { roomId, name: roomState.name });
+    // Join room and request initial participant list
+    const joinAndSync = () => {
+      socketRef.current.emit('join_room', { 
+        roomId, 
+        name: roomState.name,
+        isOwner: location.state?.isOwner || false,
+        ownerToken: localStorage.getItem(`room_owner_${roomId}`),
+        userId: roomState.userId
+      });
+      socketRef.current.emit('request_participants', { roomId });
+    };
+
+    joinAndSync();
+
+    // Set up periodic sync every 5 seconds
+    const syncInterval = setInterval(() => {
+      if (socketRef.current?.connected) {
+        socketRef.current.emit('request_participants', { roomId });
+      }
+    }, 5000);
     
     const handleParticipantsUpdate = (list) => {
-      const newParticipantName = list.length > roomState.participants.length ? 
-        list[list.length - 1].name : null;
-      
-      if (newParticipantName && newParticipantName !== roomState.name) {
-        setRoomState(prev => ({ ...prev, newParticipant: newParticipantName }));
-        setTimeout(() => setRoomState(prev => ({ ...prev, newParticipant: null })), 10000);
+      // Sort participants by join time
+      const sortedList = [...list].sort((a, b) => {
+        if (a.name === roomState.roomOwner) return -1;
+        if (b.name === roomState.roomOwner) return 1;
+        return 0;
+      });
+
+      // Check for new participants
+      if (sortedList.length > roomState.participants.length) {
+        const newParticipants = sortedList.filter(
+          newP => !roomState.participants.some(
+            oldP => oldP.name.toLowerCase() === newP.name.toLowerCase()
+          )
+        );
+        
+        if (newParticipants.length > 0) {
+          const lastNewParticipant = newParticipants[newParticipants.length - 1];
+          if (lastNewParticipant.name !== roomState.name) {
+            setNotification(lastNewParticipant.name);
+            setTimeout(() => setNotification(null), 3000);
+          }
+        }
       }
       
-      setRoomState(prev => ({ ...prev, participants: list }));
+      setRoomState(prev => ({ ...prev, participants: sortedList }));
+    };
+
+    const handleStartRoulette = () => {
+      if (roomState.participants.length < 2) {
+        setRoomState(prev => ({
+          ...prev,
+          rouletteError: 'En az 2 katılımcı gerekli'
+        }));
+        return;
+      }
+      
+      // Reset states
+      setRoomState(prev => ({ 
+        ...prev, 
+        displayedWinner: null,
+        rouletteError: ''
+      }));
+      
+      setRouletteState(prev => ({ 
+        ...prev, 
+        isSpinning: true,
+        mustSpin: false,
+        showConfetti: false
+      }));
+      
+      socketRef.current?.emit('start_roulette', { 
+        roomId,
+        ownerToken: localStorage.getItem(`room_owner_${roomId}`)
+      });
     };
 
     const handleRouletteResult = (winner) => {
-      setRoomState(prev => ({ ...prev, winner }));
+      const winnerIndex = roomState.participants.findIndex(p => p.name === winner.name);
+      if (winnerIndex !== -1) {
+        // Reset any previous states
+        setRouletteState(prev => ({
+          ...prev,
+          prizeNumber: winnerIndex,
+          mustSpin: true,
+          isSpinning: true,
+          showConfetti: false
+        }));
+      }
+    };
+
+    const handleReconnect = () => {
+      joinAndSync();
+    };
+
+    const handleRoomExpired = (data) => {
+      // Only set expired state if we're not the owner or if the roulette has actually started
+      if (!location.state?.isOwner || data.rouletteStarted) {
+        setRoomState(prev => ({ ...prev, expired: true }));
+      }
     };
 
     socketRef.current.on('participants_update', handleParticipantsUpdate);
-    socketRef.current.on('joined', () => setRoomState(prev => ({ ...prev, joined: true })));
+    socketRef.current.on('joined', () => {
+      setRoomState(prev => ({ ...prev, joined: true }));
+      joinAndSync();
+    });
+    socketRef.current.on('connect', handleReconnect);
+    socketRef.current.on('reconnect', handleReconnect);
     socketRef.current.on('join_error', (data) => setRoomState(prev => ({ ...prev, joinError: data.message })));
     socketRef.current.on('roulette_result', handleRouletteResult);
-    socketRef.current.on('room_expired', () => setRoomState(prev => ({ ...prev, expired: true })));
+    socketRef.current.on('room_expired', handleRoomExpired);
+    socketRef.current.on('roulette_error', (data) => {
+      setRoomState(prev => ({ ...prev, rouletteError: data.message }));
+      setRouletteState(prev => ({ ...prev, isSpinning: false }));
+    });
+    socketRef.current.on('roulette_start', () => {
+      setRouletteState(prev => ({ 
+        ...prev, 
+        isSpinning: true,
+        mustSpin: true,
+        prizeNumber: 0  // Başlangıç pozisyonu
+      }));
+    });
 
     return () => {
+      clearInterval(syncInterval);
+      socketRef.current?.off('participants_update');
+      socketRef.current?.off('joined');
+      socketRef.current?.off('connect');
+      socketRef.current?.off('reconnect');
+      socketRef.current?.off('join_error');
+      socketRef.current?.off('roulette_result');
+      socketRef.current?.off('room_expired');
+      socketRef.current?.off('roulette_error');
+      socketRef.current?.off('roulette_start');
       socketRef.current?.disconnect();
     };
-  }, [roomState.joined, roomId, roomState.name, roomState.participants.length]);
+  }, [roomState.joined, roomId, roomState.name, location.state]);
 
   useEffect(() => {
     if (roomState.winner) {
@@ -228,18 +392,60 @@ function JoinRoom() {
     return () => window.removeEventListener('resize', handleResize);
   }, []);
 
+  // Bildirim için useEffect
+  useEffect(() => {
+    let timer;
+    if (notification) {
+      timer = setTimeout(() => {
+        setNotification(null);
+      }, 3000);
+    }
+    return () => {
+      if (timer) {
+        clearTimeout(timer);
+      }
+    };
+  }, [notification]);
+
   // Handlers
   const handleJoin = (e) => {
     e.preventDefault();
-    if (!roomState.inputName.trim()) {
+    const trimmedName = roomState.inputName.trim();
+    
+    if (!trimmedName) {
       setRoomState(prev => ({ ...prev, joinError: 'Lütfen isminizi girin' }));
       return;
     }
+
+    // Check if trying to join as room owner
+    if (trimmedName === roomState.roomOwner) {
+      setRoomState(prev => ({
+        ...prev,
+        joinError: 'Bu isim oda sahibine ait. Lütfen başka bir isim seçin.'
+      }));
+      return;
+    }
+
+    // Check if name is already taken by another participant
+    const isNameTaken = roomState.participants.some(
+      participant => participant.name.toLowerCase() === trimmedName.toLowerCase()
+    );
+
+    if (isNameTaken) {
+      setRoomState(prev => ({
+        ...prev,
+        joinError: 'Bu isim zaten kullanılıyor. Lütfen başka bir isim seçin.'
+      }));
+      return;
+    }
+
+    const userId = getUserId(roomId, trimmedName);
     setRoomState(prev => ({
       ...prev,
       joinError: '',
-      name: roomState.inputName,
-      joined: true
+      name: trimmedName,
+      joined: true,
+      userId: userId
     }));
   };
 
@@ -250,18 +456,63 @@ function JoinRoom() {
     setTimeout(() => setRoomState(prev => ({ ...prev, copied: false })), 1500);
   };
 
+  const handleShare = async () => {
+    const inviteLink = `${window.location.origin}/rulet/${roomId}`;
+    const shareData = {
+      title: 'Kahve Ruleti',
+      text: 'Kahve Ruleti odasına katıl!',
+      url: inviteLink
+    };
+
+    try {
+      if (navigator.share) {
+        await navigator.share(shareData);
+      } else {
+        // Fallback to copy if Web Share API is not supported
+        handleCopy();
+      }
+    } catch (err) {
+      console.error('Paylaşım sırasında hata oluştu:', err);
+      // Fallback to copy on error
+      handleCopy();
+    }
+  };
+
   const handleStartRoulette = () => {
     if (roomState.participants.length < 2) {
       setRoomState(prev => ({
         ...prev,
-        rouletteError: 'Rulet başlatmak için en az iki katılımcı olmalı.'
+        rouletteError: 'En az 2 katılımcı gerekli'
       }));
-      setTimeout(() => setRoomState(prev => ({ ...prev, rouletteError: '' })), 2500);
       return;
     }
-    setRoomState(prev => ({ ...prev, displayedWinner: null }));
-    setRouletteState(prev => ({ ...prev, isSpinning: true }));
-    socketRef.current?.emit('start_roulette', { roomId });
+    
+    // Reset states
+    setRoomState(prev => ({ 
+      ...prev, 
+      displayedWinner: null,
+      rouletteError: ''
+    }));
+    
+    // Get the owner token from location state or localStorage
+    const ownerToken = location.state?.ownerToken || localStorage.getItem(`room_owner_${roomId}`);
+    
+    // Emit the start event
+    if (socketRef.current?.connected) {
+      socketRef.current.emit('start_roulette', { 
+        roomId,
+        ownerToken
+      });
+    } else {
+      setRoomState(prev => ({
+        ...prev,
+        rouletteError: 'Sunucu bağlantısı koptu. Lütfen sayfayı yenileyin.'
+      }));
+    }
+  };
+
+  const handleFinishRoulette = () => {
+    navigate('/');
   };
 
   // Render Helpers
@@ -284,6 +535,24 @@ function JoinRoom() {
       </div>
     </div>
   );
+
+  const renderWinner = () => {
+    if (!roomState.displayedWinner || rouletteState.isSpinning) return null;
+    const isWinnerHost = roomState.displayedWinner.name.includes('👑');
+    return (
+      <div className="winner-announcement">
+        <p className="winner-text">
+          {isWinnerHost ? 
+            `${roomState.displayedWinner.name}` : 
+            roomState.displayedWinner.name.toUpperCase()
+          } kahve yapmakla görevlendirildi! ☕
+        </p>
+        <button onClick={handleFinishRoulette} className="home-button">
+          <FaHome /> Ana Sayfaya Dön
+        </button>
+      </div>
+    );
+  };
 
   if (roomState.error) return renderError();
   if (roomState.expired) return renderExpired();
@@ -311,10 +580,15 @@ function JoinRoom() {
         
         <h1 className="title">Kahve Ruleti</h1>
 
-        {roomState.newParticipant && (
-          <div className="notification">
+        {notification && (
+          <div className="notification" style={{ animation: 'fadeInOut 3s forwards' }}>
             <GiCoffeeCup className="notification-icon" />
-            <p>{roomState.newParticipant} kahve ruletine katıldı!</p>
+            <p>
+              {notification === roomState.roomOwner ? 
+                `${notification.toUpperCase()} 👑` : 
+                notification.toUpperCase()
+              } kahve ruletine katıldı!
+            </p>
           </div>
         )}
 
@@ -339,100 +613,119 @@ function JoinRoom() {
             </button>
           </form>
         ) : (
-          <div className="roulette-wrapper">
-            <div className="roulette-container">
-              {roomState.participants.length > 0 && (
-                <Wheel
-                  mustStartSpinning={rouletteState.mustSpin}
-                  prizeNumber={rouletteState.prizeNumber}
-                  data={wheelData}
-                  backgroundColors={wheelColors}
-                  textColors={['#F5E6D3']}
-                  fontSize={16}
-                  outerBorderColor="#2C1810"
-                  outerBorderWidth={3}
-                  innerRadius={20}
-                  innerBorderColor="#D4A574"
-                  innerBorderWidth={2}
-                  radiusLineColor="#F5E6D3"
-                  radiusLineWidth={1}
-                  perpendicularText={true}
-                  spinDuration={0.4}
-                  startingOptionIndex={rouletteState.prizeNumber}
-                  rotationOffset={-2}
-                  disableInitialAnimation={true}
-                  dimensions={windowSize.width <= 768 ? 200 : 300}
-                  pointerProps={{
-                    src: "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZD0iTTEyIDJMNCAyMGwyMC0xMC0xMC0yeiIgZmlsbD0iI0Q0QTU3NCIvPjwvc3ZnPg==",
-                    style: { width: '30px', top: '-15px' }
-                  }}
-                  onStopSpinning={() => {
-                    setRouletteState(prev => ({ ...prev, mustSpin: false, isSpinning: false }));
-                    setTimeout(() => {
-                      setRoomState(prev => ({ ...prev, displayedWinner: prev.winner }));
-                      setRouletteState(prev => ({ ...prev, showConfetti: true }));
-                      setTimeout(() => setRouletteState(prev => ({ ...prev, showConfetti: false })), 5000);
-                    }, 500);
-                  }}
-                />
+          <>
+            <div className="roulette-wrapper">
+              <div className="roulette-container">
+                {roomState.participants.length > 0 && (
+                  <Wheel
+                    mustStartSpinning={rouletteState.mustSpin}
+                    prizeNumber={rouletteState.prizeNumber}
+                    data={roomState.participants.map(p => ({
+                      option: p.name === roomState.roomOwner ? `${p.name.toUpperCase()} 👑` : p.name.toUpperCase(),
+                      style: { backgroundColor: '#6F4E37', textColor: '#F5E6D3' }
+                    }))}
+                    backgroundColors={wheelColors}
+                    textColors={['#F5E6D3']}
+                    fontSize={16}
+                    outerBorderColor="#2C1810"
+                    outerBorderWidth={3}
+                    innerRadius={20}
+                    innerBorderColor="#D4A574"
+                    innerBorderWidth={2}
+                    radiusLineColor="#F5E6D3"
+                    radiusLineWidth={1}
+                    perpendicularText={true}
+                    spinDuration={0.8}
+                    startingOptionIndex={0}
+                    rotationOffset={-2}
+                    disableInitialAnimation={true}
+                    dimensions={windowSize.width <= 768 ? 200 : 300}
+                    pointerProps={{
+                      src: "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZD0iTTEyIDJMNCAyMGwyMC0xMC0xMC0yeiIgZmlsbD0iI0Q0QTU3NCIvPjwvc3ZnPg==",
+                      style: { width: '30px', top: '-15px' }
+                    }}
+                    onStopSpinning={() => {
+                      setRouletteState(prev => ({
+                        ...prev,
+                        mustSpin: false,
+                        isSpinning: false,
+                        showConfetti: true
+                      }));
+                      setTimeout(() => {
+                        const winner = roomState.participants[rouletteState.prizeNumber];
+                        setRoomState(prev => ({
+                          ...prev,
+                          displayedWinner: {
+                            name: winner.name === roomState.roomOwner ? 
+                              `${winner.name.toUpperCase()} 👑` : 
+                              winner.name.toUpperCase()
+                          }
+                        }));
+                      }, 500);
+                    }}
+                  />
+                )}
+              </div>
+
+              {renderWinner()}
+
+              {roomState.name === roomState.roomOwner && !roomState.displayedWinner && (
+                <button
+                  className="start-roulette-button"
+                  onClick={handleStartRoulette}
+                  disabled={rouletteState.isSpinning || roomState.participants.length < 2}
+                >
+                  {rouletteState.isSpinning ? (
+                    <>
+                      <GiCoffeeBeans className="spinning" />
+                      Çevriliyor...
+                    </>
+                  ) : (
+                    <>
+                      <GiCoffeeBeans />
+                      Ruleti Başlat
+                    </>
+                  )}
+                </button>
+              )}
+
+              {roomState.rouletteError && (
+                <div className="error-message">{roomState.rouletteError}</div>
+              )}
+
+              {!roomState.displayedWinner && !rouletteState.isSpinning && (
+                <p className="waiting-text">
+                  {roomState.name === roomState.roomOwner
+                    ? roomState.participants.length < 2 
+                      ? 'En az bir katılımcı daha bekleniyor...'
+                      : 'Ruleti başlatabilirsiniz!'
+                    : 'Oda sahibinin ruleti başlatması bekleniyor...'}
+                </p>
               )}
             </div>
 
-            {roomState.displayedWinner && !rouletteState.isSpinning && (
-              <div className="winner-announcement" ref={winnerRef}>
-                <p className="winner-text">
-                  {roomState.displayedWinner.name} kahveyi yapacak! ☕
-                </p>
+            {!rouletteState.isSpinning && !roomState.displayedWinner && (
+              <div className="bottom-controls">
+                <div className="invite-link">
+                  <input
+                    type="text"
+                    value={inviteLink}
+                    readOnly
+                    onClick={e => e.target.select()}
+                  />
+                  <div className="invite-buttons">
+                    <button onClick={handleCopy} className="copy-button">
+                      {roomState.copied ? 'Kopyalandı!' : 'Kopyala'} <FaCopy />
+                    </button>
+                    <button onClick={handleShare} className="share-button">
+                      Paylaş <FaShare />
+                    </button>
+                  </div>
+                </div>
               </div>
             )}
-
-            {roomState.name === roomState.roomOwner && !rouletteState.isSpinning && (
-              <button
-                className="start-roulette-button"
-                onClick={handleStartRoulette}
-                disabled={rouletteState.isSpinning || roomState.participants.length < 2}
-              >
-                {rouletteState.isSpinning ? (
-                  <>
-                    <GiCoffeeBeans className="spinning" />
-                    Çevriliyor...
-                  </>
-                ) : (
-                  <>
-                    <GiCoffeeBeans />
-                    Ruleti Başlat
-                  </>
-                )}
-              </button>
-            )}
-
-            {roomState.rouletteError && (
-              <div className="error-message">{roomState.rouletteError}</div>
-            )}
-
-            {!roomState.displayedWinner && !rouletteState.isSpinning && (
-              <p className="waiting-text">
-                {roomState.name === roomState.roomOwner
-                  ? 'Katılımcıları bekliyorsunuz...'
-                  : 'Oda sahibinin ruleti başlatması bekleniyor...'}
-              </p>
-            )}
-          </div>
+          </>
         )}
-
-        <div className="bottom-controls">
-          <div className="invite-link">
-            <input
-              type="text"
-              value={inviteLink}
-              readOnly
-              onClick={e => e.target.select()}
-            />
-            <button onClick={handleCopy}>
-              {roomState.copied ? 'Kopyalandı!' : 'Davet Linki Kopyala'} <FaCopy />
-            </button>
-          </div>
-        </div>
       </div>
     </div>
   );
